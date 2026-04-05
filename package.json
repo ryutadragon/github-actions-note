@@ -1,16 +1,19 @@
 {
   "name": "github-actions-note",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "noteを自動投稿するGithub Actions",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"No tests specified\" && exit 0"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
+    "@anthropic-ai/claude-code": "^1.0.16",
+    "ai": "^4.0.0",
+    "@ai-sdk/anthropic": "^1.0.0",
+    "marked": "^15.0.0",
     "playwright": "^1.55.1"
   }
 }

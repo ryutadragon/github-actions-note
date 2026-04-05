@@ -66,10 +66,8 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Claude Code SDK
-        run: |
-          npm init -y
-          npm i @anthropic-ai/claude-code
+      - name: Install dependencies
+        run: npm install
 
       - name: Research with Claude Code SDK
         run: |
@@ -144,10 +142,8 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install AI SDK
-        run: |
-          npm init -y
-          npm i ai @ai-sdk/anthropic
+      - name: Install dependencies
+        run: npm install
 
       - name: Restore research
         env:
@@ -233,10 +229,8 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install AI SDK
-        run: |
-          npm init -y
-          npm i ai @ai-sdk/anthropic
+      - name: Install dependencies
+        run: npm install
 
       - name: Restore draft json
         env:
@@ -365,7 +359,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       IS_PUBLIC: ${{ github.event.inputs.is_public }}
-      STATE_JSON: ${{ secrets.NOTE_STORAGE_STATE_JSON }}
+      STATE_JSON: ${{ secrets.NOTE_STORAGE_STATE }}
       START_URL: https://editor.note.com/new
     outputs:
       final_url: ${{ steps.publish.outputs.published_url || steps.publish.outputs.draft_url }}
@@ -378,18 +372,17 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Playwright
+      - name: Install dependencies
         run: |
-          npm init -y
-          npm i playwright marked
+          npm install
           npx playwright install --with-deps chromium | cat
 
       - name: Prepare storageState
         id: state
         run: |
-          test -n "$STATE_JSON" || (echo "ERROR: NOTE_STORAGE_STATE_JSON secret is not set" && exit 1)
+          test -n "$STATE_JSON" || { echo "ERROR: NOTE_STORAGE_STATE secret is not set"; exit 1; }
           mkdir -p "$RUNNER_TEMP"
-          echo "$STATE_JSON" > "$RUNNER_TEMP/note-state.json"
+          printf '%s' "$STATE_JSON" > "$RUNNER_TEMP/note-state.json"
           echo "STATE_PATH=$RUNNER_TEMP/note-state.json" >> $GITHUB_OUTPUT
 
       - name: Ensure jq (post)
