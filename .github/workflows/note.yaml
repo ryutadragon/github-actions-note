@@ -49,10 +49,11 @@ env:
 
 jobs:
   research:
-    name: Research (CCSDK WebSearch/WebFetch)
+    name: Research (Tavily)
     runs-on: ubuntu-latest
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
       THEME: ${{ github.event.inputs.theme }}
       TARGET: ${{ github.event.inputs.target }}
     outputs:
@@ -69,37 +70,67 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Research with Claude Code SDK
+      - name: Research with Tavily
         run: |
           cat > research.mjs <<'EOF'
-          import { query } from '@anthropic-ai/claude-code';
+          import { generateText } from 'ai';
+          import { anthropic } from '@ai-sdk/anthropic';
           import fs from 'fs';
           const theme = process.env.THEME || '';
           const target = process.env.TARGET || '';
           const today = new Date().toISOString().slice(0,10);
           const artifactsDir = '.note-artifacts';
           fs.mkdirSync(artifactsDir, { recursive: true });
-          const sys = [
-            'あなたは最新情報の収集と要約に特化した超一流のリサーチャーです。',
-            '事実ベース・一次情報優先・本文内にMarkdownリンクで出典を埋め込むこと。',
-            '十分な分量（目安: 2,000語以上）。各節で出典を本文に埋め込む。',
-            'WebSearch と WebFetch を必ず使用し、一次情報（公的機関・規格・論文・公式）を優先する。',
-          ].join('\n');
-          const userPrompt = `以下のテーマとターゲットに対する最終版のリサーチレポートを作成してください。\n【重要】途中経過や確認質問は一切せず、最終レポートのみを返してください。不明点がある場合は「前提と仮定」セクションで簡潔に仮定を明記してから続行してください。事実ベースで一次情報を最優先し、本文にMarkdownリンクで出典を埋め込んでください。\n---\nテーマ: ${theme}\nターゲット: ${target}\n現在日付: ${today}`;
-          const messages = [];
-          for await (const msg of query({
-            prompt: userPrompt,
-            options: {
-              customSystemPrompt: sys,
-              allowedTools: ['WebSearch','WebFetch'],
-              permissionMode: 'acceptEdits',
-            },
-          })) { messages.push(msg); }
-          const assistantTexts = messages.filter(m=>m.type==='assistant').map(m=>{
-            const c=m.message?.content; if(Array.isArray(c)){return c.filter(b=>b?.type==='text').map(b=>b.text).join('\n');} return '';
-          }).filter(Boolean).join('\n\n');
-          fs.writeFileSync(`${artifactsDir}/research.md`, assistantTexts || '');
-          try { fs.writeFileSync(`${artifactsDir}/research_trace.json`, JSON.stringify(messages, null, 2)); } catch {}
+          const modelName = 'claude-sonnet-4-5-20250929';
+          const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
+          function extractJsonFlexible(raw){const t=(raw||'').trim().replace(/​/g,'');try{return JSON.parse(t);}catch{}const fence=t.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/);if(fence&&fence[1]){try{return JSON.parse(fence[1].trim());}catch{}}let f=t.indexOf('['),l=t.lastIndexOf(']');if(f!==-1&&l!==-1&&l>f){try{return JSON.parse(t.slice(f,l+1));}catch{}}f=t.indexOf('{');l=t.lastIndexOf('}');if(f!==-1&&l!==-1&&l>f){try{return JSON.parse(t.slice(f,l+1));}catch{}}return null;}
+          async function proposeQueries(){
+            const sys='あなたはリサーチ設計の専門家です。与えられたテーマとターゲットについて、最新情報と一次情報に当たるための日本語検索クエリを最大8件、JSON配列(文字列のみ)で返してください。公的機関・公式・統計・調査レポートに当たるクエリを優先。出力はJSON配列のみ。';
+            const prompt=`テーマ: ${theme}\nターゲット: ${target}\n現在日付: ${today}`;
+            const { text } = await generateText({ model: anthropic(modelName), system: sys, prompt, temperature:0, maxTokens:1200 });
+            const arr=extractJsonFlexible(text||'');
+            return Array.isArray(arr)?arr.map(String).map(s=>s.trim()).filter(Boolean).slice(0,8):[];
+          }
+          async function tavilySearch(q){
+            try{
+              const res=await fetch('https://api.tavily.com/search',{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ api_key: TAVILY_API_KEY, query: q, search_depth:'advanced', max_results:5, include_answer:true }) });
+              if(!res.ok){ console.error('tavily http', res.status, q); return { query:q, answer:'', results:[] }; }
+              const j=await res.json();
+              return { query:q, answer:j.answer||'', results:(j.results||[]).map(r=>({title:r.title,url:r.url,content:r.content})) };
+            }catch(e){ console.error('tavily err', q, String(e)); return { query:q, answer:'', results:[] }; }
+          }
+          function formatEvidence(items){
+            return items.map(it=>{
+              const lines=[`## 検索: ${it.query}`];
+              if(it.answer) lines.push(`要約: ${it.answer}`);
+              for(const r of it.results){ lines.push(`- [${r.title}](${r.url})\n  ${String(r.content||'').slice(0,500)}`); }
+              return lines.join('\n');
+            }).join('\n\n');
+          }
+          async function main(){
+            let queries=[];
+            if(TAVILY_API_KEY){ try{ queries=await proposeQueries(); }catch(e){ console.error('proposeQueries failed', String(e)); } }
+            else { console.error('TAVILY_API_KEY not set; proceeding without web evidence'); }
+            console.log('queries:', JSON.stringify(queries));
+            const results=[];
+            for(const q of queries){ results.push(await tavilySearch(q)); }
+            const evidence=formatEvidence(results);
+            const sys=[
+              'あなたは最新情報の収集と要約に特化した超一流のリサーチャーです。',
+              '提供されたエビデンス(Tavily検索結果)に基づき、テーマとターゲットに対するリサーチレポートを作成してください。',
+              '事実ベース・一次情報優先。本文内に出典をMarkdownリンクで埋め込む(エビデンスのURLを使う)。',
+              'エビデンスにない数値や固有名詞を創作しない。不明点は「前提と仮定」セクションに明記する。',
+              '十分な分量(目安: 1,500語以上)。途中経過や確認質問は書かず、最終レポートのみを返す。',
+            ].join('\n');
+            const prompt=[`# テーマ\n${theme}`,`# ターゲット\n${target}`,`# 現在日付\n${today}`,'# エビデンス(Tavily検索結果)', evidence||'(検索結果なし。一般知識の範囲で書き、推測は明示する)'].join('\n\n');
+            const { text } = await generateText({ model: anthropic(modelName), system: sys, prompt, temperature:0.4, maxTokens:30000 });
+            const report=(text||'').trim();
+            if(!report){ console.error('empty research report'); process.exit(1); }
+            fs.writeFileSync(`${artifactsDir}/research.md`, report);
+            try{ fs.writeFileSync(`${artifactsDir}/research_trace.json`, JSON.stringify({queries,results},null,2)); }catch{}
+            console.log('research.md bytes:', report.length);
+          }
+          await main();
           EOF
           node research.mjs
 
