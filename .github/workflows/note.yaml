@@ -352,9 +352,113 @@ jobs:
           echo "$b64" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+  polish:
+    name: Polish (stop-ai-slop-jp)
+    needs: factcheck
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    outputs:
+      title: ${{ steps.collect.outputs.title }}
+      final_b64: ${{ steps.collect.outputs.final_b64 }}
+      slop_score: ${{ steps.collect.outputs.slop_score }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Restore final json
+        env:
+          FINAL_B64: ${{ needs.factcheck.outputs.final_b64 }}
+        run: |
+          mkdir -p .note-artifacts
+          test -n "$FINAL_B64" || { echo "final_b64 output is empty"; exit 1; }
+          echo "$FINAL_B64" | base64 -d > .note-artifacts/final.json || echo "$FINAL_B64" | base64 --decode > .note-artifacts/final.json
+
+      - name: Remove AI slop (score -> rewrite -> rescore)
+        run: |
+          cat > polish.mjs <<'EOF'
+          import { generateText } from 'ai';
+          import { anthropic } from '@ai-sdk/anthropic';
+          import fs from 'fs';
+          const modelName='claude-sonnet-4-5-20250929';
+          const THRESHOLD=35; const MAX_REWRITES=2;
+          const final=JSON.parse(fs.readFileSync('.note-artifacts/final.json','utf8'));
+          function read(f){ try{ return fs.readFileSync(f,'utf8'); }catch{ return ''; } }
+          const DIR='skills/stop-ai-slop-jp';
+          const skillCore=read(`${DIR}/SKILL.md`);
+          const skillFull=[skillCore, read(`${DIR}/references/structures.md`), read(`${DIR}/references/phrases.md`), read(`${DIR}/references/examples.md`)].filter(Boolean).join('\n\n');
+          function extractJsonFlexible(raw){const t=(raw||'').trim().replace(/​/g,'');try{return JSON.parse(t);}catch{}const m=t.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/);if(m&&m[1]){try{return JSON.parse(m[1].trim());}catch{}}const f=t.indexOf('{'),l=t.lastIndexOf('}');if(f!==-1&&l!==-1&&l>f){const c=t.slice(f,l+1);try{return JSON.parse(c);}catch{}}return null;}
+          function stripCodeFence(s){const t=String(s||'').trim();const m=t.match(/^```[a-zA-Z0-9_-]*\s*([\s\S]*?)\s*```\s*$/);if(m&&m[1])return m[1].trim();return t;}
+          function totalOf(o){ if(!o) return null; const t=Number(o.total); if(Number.isFinite(t)) return t; const sum=['stance','rhythm','agency','specificity','reduction'].reduce((a,k)=>a+(Number(o[k])||0),0); return sum>0?sum:null; }
+          async function score(body){
+            const sys=`あなたは日本語のAI臭を検出する超一流の編集者です。以下のスキル定義に厳密に従って本文を採点してください。\n\n${skillCore}\n\n【出力】立場(stance)・リズム(rhythm)・主体性(agency)・具体性(specificity)・削減(reduction)を各1〜10点で採点し、合計(total, 50点満点)とAI臭の具体的指摘(notes)を返す。JSONのみ: {"stance":n,"rhythm":n,"agency":n,"specificity":n,"reduction":n,"total":n,"notes":"..."}`;
+            const {text}=await generateText({model:anthropic(modelName),system:sys,prompt:String(body),temperature:0,maxTokens:1500});
+            const o=extractJsonFlexible(text); return { total: totalOf(o), notes:(o&&o.notes)||'' };
+          }
+          async function rewrite(body, notes){
+            const sys=`あなたは日本語の超一流の編集者です。以下のスキルに従い、本文からAI臭を取り除いて「人間が書いた文章」に直してください。\n\n${skillFull}\n\n【厳守】事実・固有名詞・数値・Markdownリンク・参考文献セクションは改変しない。情報を削除・捏造しない。構成は尊重しつつ、主体の不在・命題型見出し・壮大化・両論併記・リズムの均一さ・偏愛語・不要な記号を直す。\n【出力】修正後の本文(Markdown)のみ。前置き・解説・JSONは一切付けない。`;
+            const prompt=[`## AI臭の指摘\n${notes||'(指摘なし。スキルの基準で総点検する)'}`,'## 本文', String(body)].join('\n\n');
+            const {text}=await generateText({model:anthropic(modelName),system:sys,prompt,temperature:0.4,maxTokens:30000});
+            return stripCodeFence(text);
+          }
+          function writeOut(body, total, rewrites){
+            const out={ title: final.title, body, tags: Array.isArray(final.tags)?final.tags:[] };
+            fs.writeFileSync('.note-artifacts/final.json', JSON.stringify(out,null,2));
+            console.log('SLOP_SCORE=' + (total==null?'NA':total));
+            console.log('SLOP_REWRITES=' + rewrites);
+          }
+          async function main(){
+            let curBody=String(final.body||'');
+            if(!curBody.trim()){ writeOut(curBody, null, 0); console.log('SLOP_SKIP=empty-body'); return; }
+            let cur=await score(curBody);
+            console.log(`initial total: ${cur.total}`);
+            if(cur.total==null){ writeOut(curBody, null, 0); console.log('SLOP_SKIP=score-failed'); return; }
+            let best={body:curBody, total:cur.total}; let rewrites=0;
+            while(best.total < THRESHOLD && rewrites < MAX_REWRITES){
+              rewrites++;
+              const rb=await rewrite(curBody, cur.notes);
+              if(!rb||!rb.trim()){ console.log(`rewrite ${rewrites}: empty, stop`); break; }
+              curBody=rb; cur=await score(curBody);
+              console.log(`rewrite ${rewrites} total: ${cur.total}`);
+              if(cur.total!=null && cur.total>best.total){ best={body:curBody, total:cur.total}; }
+            }
+            writeOut(best.body, best.total, rewrites);
+          }
+          await main();
+          EOF
+          node polish.mjs | tee polish.log
+
+      - name: Upload polished artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: polished-artifact
+          path: .note-artifacts/final.json
+
+      - name: Collect final
+        id: collect
+        run: |
+          title=$(node -e "console.log(JSON.parse(require('fs').readFileSync('.note-artifacts/final.json','utf8')).title)")
+          b64=$(base64 -w 0 .note-artifacts/final.json 2>/dev/null || base64 .note-artifacts/final.json)
+          score=$(grep '^SLOP_SCORE=' polish.log | tail -n1 | cut -d'=' -f2-)
+          echo "title<<EOF" >> $GITHUB_OUTPUT
+          echo "$title" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "final_b64<<EOF" >> $GITHUB_OUTPUT
+          echo "$b64" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "slop_score=${score:-NA}" >> $GITHUB_OUTPUT
+
   post:
     name: Post to note.com (Playwright)
-    needs: factcheck
+    needs: polish
     if: ${{ github.event.inputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     env:
@@ -395,7 +499,7 @@ jobs:
       - name: Restore final
         id: draft
         env:
-          FINAL_B64: ${{ needs.factcheck.outputs.final_b64 }}
+          FINAL_B64: ${{ needs.polish.outputs.final_b64 }}
         run: |
           test -n "$FINAL_B64" || { echo "final_b64 output is empty"; exit 1; }
           echo "$FINAL_B64" | base64 -d > final.json || echo "$FINAL_B64" | base64 --decode > final.json
